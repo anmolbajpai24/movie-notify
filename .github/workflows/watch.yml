@@ -15,6 +15,7 @@ on:
 
 permissions:
   actions: write             # lets the job switch itself off after alerting
+  contents: read             # checkout needs this explicitly once any permission is set
 
 jobs:
   poll:
