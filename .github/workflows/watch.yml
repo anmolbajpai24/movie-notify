@@ -1,0 +1,46 @@
+# .github/workflows/watch.yml
+# Put spidey_watch.py (fully filled in) at the repo root.
+# The repo MUST be private — the script embeds your captured cookies/headers.
+#
+# Test after pushing: Actions tab > spidey-watch > Run workflow.
+# Log says "not live yet"  -> runner IP works, you're armed. Do nothing.
+# Log shows HTTP 403/error -> GitHub's IPs are blocked; use phone/VPS instead.
+
+name: spidey-watch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # GH cron drifts 5-20 min under load; fine here
+  workflow_dispatch: {}      # manual "Run workflow" button for testing
+
+permissions:
+  actions: write             # lets the job switch itself off after alerting
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - id: watch
+        shell: bash
+        run: |
+          set +e
+          python3 spidey_watch.py --once
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # exit 1 only on a real poll failure so GitHub emails you a red run
+          [ "$code" -eq 1 ] && exit 1
+          exit 0
+
+      - name: Disable workflow after alert
+        if: steps.watch.outputs.code == '42'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable watch.yml -R "$GITHUB_REPOSITORY"
