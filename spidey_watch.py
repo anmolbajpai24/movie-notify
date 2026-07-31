@@ -4,8 +4,10 @@ spidey_watch.py — pings your phone the moment showtimes for a target date go l
 
 How it works: it replays the exact showtimes request the cinema site makes
 (you capture it once from DevTools), pointed at the not-yet-live date.
-When the response starts containing sessions, it sends a push via ntfy
-(and optionally Telegram) and exits.
+When the target cinema lists TARGET_EXPERIENCE sessions (e.g. SCREEN X),
+it sends an urgent push via ntfy (and optionally Telegram) and exits.
+If the cinema goes live with only other formats, it sends a single
+low-priority heads-up and keeps watching.
 
 Runbook:
  1. Phone: install the ntfy app, subscribe to the topic you set in NTFY_TOPIC.
@@ -16,7 +18,7 @@ Runbook:
  3. Convert that cURL into METHOD / URL / HEADERS / PAYLOAD below.
     (Fastest: paste the cURL into Claude Code and ask it to fill this file.)
     Keep headers exactly as captured — User-Agent, x-* app headers, cookies.
- 4. Dry run with the LIVE date still in PAYLOAD:
+ 4. Dry run with a LIVE date in PAYLOAD that lists TARGET_EXPERIENCE shows:
        python3 spidey_watch.py --check     -> should say WOULD ALERT: yes
     Then set the date in PAYLOAD to the target date and:
        python3 spidey_watch.py --check     -> should say WOULD ALERT: no
@@ -34,6 +36,7 @@ import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
@@ -62,9 +65,13 @@ DETECT_PATH = ""
 TARGET_THEATRE_ID = "310"
 TARGET_CINEMA_NAME = "jasola"
 
-# Experience label counted and named in the alert text (info, not a gate) —
-# the alert fires when the target cinema lists ANY shows for the date.
+# Experience label that GATES the urgent alert: it fires only when the target
+# cinema lists shows under this label for the date. If the cinema goes live
+# with only other formats, a one-time low-priority heads-up is sent (tracked
+# via LIVE_FLAG so restarts/cron runs never repeat it) and polling continues.
+# Leave "" to alert on any show at the target cinema.
 TARGET_EXPERIENCE = "SCREEN X"
+LIVE_FLAG = Path(__file__).with_name(".spidey_live_no_screenx_sent")
 
 # ---------------------------------------------- request (paste from DevTools) --
 
@@ -146,10 +153,19 @@ def find_signals(node, path="", hits=None) -> dict:
     return hits
 
 
-def would_alert(signals: dict) -> bool:
+def is_live(signals: dict) -> bool:
+    """The (narrowed) response lists any shows at all — the cinema is live."""
     if DETECT_PATH:
         return signals.get(DETECT_PATH, 0) > 0
     return sum(signals.values()) > 0
+
+
+def would_alert(signals: dict, data) -> bool:
+    """Urgent-alert gate: TARGET_EXPERIENCE must have shows listed at the
+    target cinema. Falls back to 'any shows' when TARGET_EXPERIENCE is ""."""
+    if TARGET_EXPERIENCE:
+        return screenx_count(data) > 0
+    return is_live(signals)
 
 
 def narrow(data):
@@ -188,25 +204,48 @@ def experience_counts(data) -> dict:
     return out
 
 
+def screenx_count(data) -> int:
+    """Shows at the target cinema under the TARGET_EXPERIENCE label."""
+    norm = TARGET_EXPERIENCE.replace(" ", "").upper()
+    return sum(n for lbl, n in experience_counts(data).items()
+               if lbl.replace(" ", "").upper() == norm)
+
+
+def cinema_name(data) -> str:
+    try:
+        return data["output"]["movieCinemaSessions"][0]["cinema"]["name"]
+    except (KeyError, IndexError, TypeError):
+        return "Target cinema"
+
+
 def alert_message(data) -> str:
-    """Alert text: which cinema went live, how many shows, which experiences."""
+    """Urgent alert text: the TARGET_EXPERIENCE count up front, then the
+    full per-experience breakdown."""
     exps = experience_counts(data)
     total = sum(exps.values())
-    try:
-        where = data["output"]["movieCinemaSessions"][0]["cinema"]["name"]
-    except (KeyError, IndexError, TypeError):
-        where = "Target cinema"
     parts = ", ".join(f"{n}x {lbl}" for lbl, n in
                       sorted(exps.items(), key=lambda kv: -kv[1]))
-    want = ""
     if TARGET_EXPERIENCE:
-        norm = TARGET_EXPERIENCE.replace(" ", "").upper()
-        n_want = sum(n for lbl, n in exps.items()
-                     if lbl.replace(" ", "").upper() == norm)
-        want = (f" {TARGET_EXPERIENCE}: {n_want} shows." if n_want
-                else f" No {TARGET_EXPERIENCE} shows listed yet.")
-    return (f"{where} just listed {total} shows for {PAYLOAD.get('dated')} "
-            f"({parts}).{want} Go book before the good seats vanish.")
+        return (f"{cinema_name(data)} listed {screenx_count(data)}x "
+                f"{TARGET_EXPERIENCE} for {PAYLOAD.get('dated')} "
+                f"({total} shows total: {parts}). "
+                f"Go book before the good seats vanish.")
+    return (f"{cinema_name(data)} just listed {total} shows for "
+            f"{PAYLOAD.get('dated')} ({parts}). "
+            f"Go book before the good seats vanish.")
+
+
+def notify_live_no_screenx(data) -> None:
+    """One-time low-priority heads-up: the cinema is live for the date but
+    has no TARGET_EXPERIENCE shows yet. LIVE_FLAG (a file next to this
+    script) makes it fire at most once across restarts and cron runs; it is
+    only written after ntfy accepts the push, so a failed send retries."""
+    if LIVE_FLAG.exists():
+        return
+    msg = (f"{cinema_name(data)} is live for {PAYLOAD.get('dated')}, "
+           f"no {TARGET_EXPERIENCE} listed yet — watching on.")
+    if notify(f"Live, waiting for {TARGET_EXPERIENCE}", msg, priority="low"):
+        LIVE_FLAG.touch()
 
 
 def notify(title: str, message: str, priority: str = "urgent") -> bool:
@@ -254,13 +293,15 @@ def check_once() -> None:
         n_kept = len(data["output"]["movieCinemaSessions"])
         log(f"cinemas in city response: {n_all}; matching target cinema: {n_kept}")
         log(f"experiences at target: {experience_counts(data) or '{}'}")
+    if TARGET_EXPERIENCE:
+        log(f"{TARGET_EXPERIENCE} shows at target: {screenx_count(data)}")
     if signals:
         log("candidate show lists found:")
         for p, n in sorted(signals.items(), key=lambda kv: -kv[1]):
             log(f"  {n:4d}  {p}")
     else:
         log("no session-like lists in response")
-    log(f"WOULD ALERT: {'yes' if would_alert(signals) else 'no'}")
+    log(f"WOULD ALERT: {'yes' if would_alert(signals, data) else 'no'}")
 
 
 def watch() -> None:
@@ -274,13 +315,19 @@ def watch() -> None:
             data = narrow(fetch())
             signals = find_signals(data)
             failures = 0
-            if would_alert(signals):
-                total = (signals.get(DETECT_PATH) if DETECT_PATH
-                         else sum(signals.values()))
-                log(f"SHOWS LIVE — {total} entries. Alerting and exiting.")
-                notify("Spidey shows are LIVE", alert_message(data))
+            if would_alert(signals, data):
+                n_sx = screenx_count(data) if TARGET_EXPERIENCE else \
+                    sum(signals.values())
+                log(f"LIVE — {n_sx}x {TARGET_EXPERIENCE or 'shows'}. "
+                    f"Alerting and exiting.")
+                notify(f"Spidey {TARGET_EXPERIENCE or 'shows'} LIVE",
+                       alert_message(data))
                 return
-            log("not live yet")
+            if TARGET_EXPERIENCE and is_live(signals):
+                notify_live_no_screenx(data)
+                log(f"live, but no {TARGET_EXPERIENCE} yet — watching on")
+            else:
+                log("not live yet")
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             failures += 1
             log(f"poll failed ({failures} in a row): {e}")
@@ -294,8 +341,10 @@ def watch() -> None:
 
 
 def once() -> int:
-    """Single stateless poll for cron / GitHub Actions (see watch.yml).
-    Exit codes: 0 = not live yet, 42 = LIVE (alert sent), 1 = poll failed."""
+    """Single poll for cron / GitHub Actions (see watch.yml). Stateless
+    except for LIVE_FLAG, the file that dedupes the one-time heads-up —
+    on a runner with a fresh filesystem each run, that push may repeat.
+    Exit codes: 0 = no alert, 42 = LIVE (urgent alert sent), 1 = poll failed."""
     sanity()
     try:
         data = narrow(fetch())
@@ -303,12 +352,17 @@ def once() -> int:
         log(f"poll failed: {e}")
         return 1
     signals = find_signals(data)
-    if would_alert(signals):
-        total = (signals.get(DETECT_PATH) if DETECT_PATH
-                 else sum(signals.values()))
-        log(f"SHOWS LIVE — {total} entries. Alerting.")
-        notify("Spidey shows are LIVE", alert_message(data))
+    if would_alert(signals, data):
+        n_sx = screenx_count(data) if TARGET_EXPERIENCE else \
+            sum(signals.values())
+        log(f"LIVE — {n_sx}x {TARGET_EXPERIENCE or 'shows'}. Alerting.")
+        notify(f"Spidey {TARGET_EXPERIENCE or 'shows'} LIVE",
+               alert_message(data))
         return 42
+    if TARGET_EXPERIENCE and is_live(signals):
+        notify_live_no_screenx(data)
+        log(f"live, but no {TARGET_EXPERIENCE} yet — watching on")
+        return 0
     log("not live yet")
     return 0
 
