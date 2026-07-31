@@ -28,8 +28,15 @@ Runbook:
     Keep the laptop awake — WSL2 pauses when Windows sleeps.
  6. Laptop-free: run `python3 spidey_watch.py --once` from any scheduler
     (cron, GitHub Actions — see watch.yml). One stateless poll per run.
+ 7. Test without pinging the main topic:
+       python3 spidey_watch.py --check --date 2026-08-02
+    --date overrides PAYLOAD's date for this run only and reroutes EVERY
+    push (armed / urgent / soft / heartbeat) to NTFY_TOPIC + "-hb".
+    --heartbeat adds a low-priority status ping per poll, always to the
+    "-hb" topic. Subscribe to that second topic to use either flag.
 """
 
+import argparse
 import json
 import random
 import re
@@ -45,6 +52,13 @@ import requests
 NTFY_TOPIC = "spiderman-tuesday-1234"     # your ntfy.sh topic (make it unguessable)
 BOOKING_URL = ("https://www.pvrcinemas.com/moviesessions/"
                "Delhi-NCR/SPIDERMAN-BRAND-NEW-DAY/35294")  # opened on notification tap
+
+# Runtime flags — set from the CLI in __main__, never edited by hand.
+# HEARTBEAT (--heartbeat): low-priority status ping after every poll, always
+# to NTFY_TOPIC + "-hb". SAFE_MODE (--date): the run is a test — reroute
+# EVERY push to the "-hb" topic so the main topic can never be pinged.
+HEARTBEAT = False
+SAFE_MODE = False
 
 POLL_BASE_SECONDS = 600                   # ~10 min between checks
 POLL_JITTER_SECONDS = 180                 # +/- random spread so polling looks human
@@ -235,24 +249,33 @@ def alert_message(data) -> str:
             f"Go book before the good seats vanish.")
 
 
+_soft_sent = False  # in-run dedupe for the heads-up below
+
+
 def notify_live_no_screenx(data) -> None:
     """One-time low-priority heads-up: the cinema is live for the date but
     has no TARGET_EXPERIENCE shows yet. LIVE_FLAG (a file next to this
     script) makes it fire at most once across restarts and cron runs; it is
-    only written after ntfy accepts the push, so a failed send retries."""
-    if LIVE_FLAG.exists():
+    only written after ntfy accepts the push, so a failed send retries.
+    SAFE_MODE test runs ignore the file both ways — they dedupe in-memory
+    only, and never write the flag the real run depends on."""
+    global _soft_sent
+    if _soft_sent or (not SAFE_MODE and LIVE_FLAG.exists()):
         return
     msg = (f"{cinema_name(data)} is live for {PAYLOAD.get('dated')}, "
            f"no {TARGET_EXPERIENCE} listed yet — watching on.")
     if notify(f"Live, waiting for {TARGET_EXPERIENCE}", msg, priority="low"):
-        LIVE_FLAG.touch()
+        _soft_sent = True
+        if not SAFE_MODE:
+            LIVE_FLAG.touch()
 
 
 def notify(title: str, message: str, priority: str = "urgent") -> bool:
+    topic = NTFY_TOPIC + ("-hb" if SAFE_MODE else "")
     ok = False
     try:
         r = requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
+            f"https://ntfy.sh/{topic}",
             data=message.encode(),
             headers={"Title": title, "Priority": priority,
                      "Click": BOOKING_URL, "Tags": "rotating_light"},
@@ -261,7 +284,8 @@ def notify(title: str, message: str, priority: str = "urgent") -> bool:
         ok = r.ok
     except requests.RequestException as e:
         log(f"ntfy send failed: {e}")
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    # Telegram has no side topic to divert to, so SAFE_MODE suppresses it.
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and not SAFE_MODE:
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -272,6 +296,27 @@ def notify(title: str, message: str, priority: str = "urgent") -> bool:
         except requests.RequestException as e:
             log(f"telegram send failed: {e}")
     return ok
+
+
+def heartbeat(n: int, status: str) -> None:
+    """--heartbeat: LOW-priority status ping after every poll. Always posts
+    to NTFY_TOPIC + "-hb" so the main topic stays alert-only."""
+    if not HEARTBEAT:
+        return
+    where = TARGET_CINEMA_NAME.title() if TARGET_CINEMA_NAME \
+        else PAYLOAD.get("city", "city")
+    msg = (f"poll {n} {datetime.now():%H:%M} — "
+           f"{where} {PAYLOAD.get('dated')}: {status}")
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}-hb",
+            data=msg.encode(),
+            headers={"Title": "Watcher heartbeat", "Priority": "low",
+                     "Tags": "stopwatch"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        log(f"heartbeat send failed: {e}")
 
 
 def sanity() -> None:
@@ -301,7 +346,9 @@ def check_once() -> None:
             log(f"  {n:4d}  {p}")
     else:
         log("no session-like lists in response")
-    log(f"WOULD ALERT: {'yes' if would_alert(signals, data) else 'no'}")
+    verdict = "yes" if would_alert(signals, data) else "no"
+    log(f"WOULD ALERT: {verdict}")
+    heartbeat(1, f"dry-run check — WOULD ALERT: {verdict}")
 
 
 def watch() -> None:
@@ -309,8 +356,11 @@ def watch() -> None:
     log(f"armed — polling every ~{POLL_BASE_SECONDS // 60} min")
     notify("Watcher armed", "Spidey showtime watcher is running. This is the test push.",
            priority="default")
+    heartbeat(0, "watcher armed")
     failures = 0
+    polls = 0
     while True:
+        polls += 1
         try:
             data = narrow(fetch())
             signals = find_signals(data)
@@ -322,15 +372,20 @@ def watch() -> None:
                     f"Alerting and exiting.")
                 notify(f"Spidey {TARGET_EXPERIENCE or 'shows'} LIVE",
                        alert_message(data))
+                heartbeat(polls, f"{n_sx}x {TARGET_EXPERIENCE or 'shows'} "
+                                 f"LIVE — alerted, exiting")
                 return
             if TARGET_EXPERIENCE and is_live(signals):
                 notify_live_no_screenx(data)
                 log(f"live, but no {TARGET_EXPERIENCE} yet — watching on")
+                heartbeat(polls, f"live, no {TARGET_EXPERIENCE} yet")
             else:
                 log("not live yet")
+                heartbeat(polls, "not live yet")
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             failures += 1
             log(f"poll failed ({failures} in a row): {e}")
+            heartbeat(polls, f"poll failed ({failures} in a row)")
             if failures == 6:
                 notify("Watcher is failing",
                        "6 consecutive poll failures — cookies/token may have expired. "
@@ -350,6 +405,7 @@ def once() -> int:
         data = narrow(fetch())
     except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
         log(f"poll failed: {e}")
+        heartbeat(1, "poll failed")
         return 1
     signals = find_signals(data)
     if would_alert(signals, data):
@@ -358,19 +414,43 @@ def once() -> int:
         log(f"LIVE — {n_sx}x {TARGET_EXPERIENCE or 'shows'}. Alerting.")
         notify(f"Spidey {TARGET_EXPERIENCE or 'shows'} LIVE",
                alert_message(data))
+        heartbeat(1, f"{n_sx}x {TARGET_EXPERIENCE or 'shows'} LIVE — alerted")
         return 42
     if TARGET_EXPERIENCE and is_live(signals):
         notify_live_no_screenx(data)
         log(f"live, but no {TARGET_EXPERIENCE} yet — watching on")
+        heartbeat(1, f"live, no {TARGET_EXPERIENCE} yet")
         return 0
     log("not live yet")
+    heartbeat(1, "not live yet")
     return 0
 
 
 if __name__ == "__main__":
-    if "--check" in sys.argv:
+    ap = argparse.ArgumentParser(
+        description="Pings your phone when target-date showtimes go live.")
+    ap.add_argument("--check", action="store_true",
+                    help="one dry-run poll, print diagnostics, send no alerts")
+    ap.add_argument("--once", action="store_true",
+                    help="one real poll for cron/CI (exit 42 = alerted)")
+    ap.add_argument("--heartbeat", action="store_true",
+                    help="low-priority status push per poll to NTFY_TOPIC-hb")
+    ap.add_argument("--date", metavar="YYYY-MM-DD",
+                    help="override PAYLOAD's date for this run and route all "
+                         "pushes to NTFY_TOPIC-hb (test mode)")
+    args = ap.parse_args()
+    HEARTBEAT = args.heartbeat
+    if args.date:
+        try:
+            datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            ap.error(f"--date {args.date!r} is not a valid YYYY-MM-DD date")
+        PAYLOAD["dated"] = args.date
+        SAFE_MODE = True
+        log(f"date override {args.date} — every push goes to {NTFY_TOPIC}-hb")
+    if args.check:
         check_once()
-    elif "--once" in sys.argv:
+    elif args.once:
         sys.exit(once())
     else:
         watch()
